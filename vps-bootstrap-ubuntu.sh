@@ -22,6 +22,9 @@ for arg in "$@"; do
   esac
 done
 
+# Для перезапуска внутри tmux с теми же аргументами (--dry-run и т.д.)
+BOOTSTRAP_ARGS=("$@")
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -45,6 +48,22 @@ run_cmd() {
 
 require_root() {
   [[ "${EUID:-0}" -eq 0 ]] || die "Запустите от root: sudo bash $0"
+}
+
+maybe_reexec_tmux() {
+  [[ "${DRY_RUN}" == "1" ]] && return 0
+  [[ -n "${TMUX:-}" ]] && return 0
+  [[ "${VPS_BOOTSTRAP_IN_TMUX:-}" == "1" ]] && return 0
+  log_warn "Длительная установка: не закрывайте SSH-сессию до завершения скрипта."
+  prompt_yn "Запустить сценарий в tmux (сессия vps-bootstrap; после обрыва: tmux attach -t vps-bootstrap)?" y || return 0
+  local script_path
+  script_path=$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")
+  if ! command -v tmux &>/dev/null; then
+    apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
+  fi
+  export VPS_BOOTSTRAP_IN_TMUX=1
+  exec tmux new-session -A -s vps-bootstrap bash "$script_path" "${BOOTSTRAP_ARGS[@]}"
 }
 
 setup_logging() {
@@ -144,7 +163,7 @@ phase_base() {
 phase_timezone_ntp() {
   prompt_yn "Настроить часовой пояс и синхронизацию времени (NTP, systemd-timesyncd)?" y || return 0
   local tz
-  read_nonempty tz "Часовой пояс (например Europe/Moscow или UTC): "
+  read_nonempty tz "Часовой пояс (например Europe/Prague или UTC): "
   if [[ "${DRY_RUN}" == "1" ]]; then
     log_info "[DRY-RUN] timedatectl set-timezone $tz"
     SETUP_TIMEZONE="$tz"
@@ -162,8 +181,8 @@ phase_timezone_ntp() {
 
 phase_essentials() {
   log_info "Базовые утилиты и needrestart..."
-  apt_install vim-tiny nano htop jq git tmux rsync bind9-dnsutils needrestart
-  log_ok "Установлены: vim-tiny, nano, htop, jq, git, tmux, rsync, bind9-dnsutils, needrestart."
+  apt_install vim-tiny nano htop nload jq git tmux rsync bind9-dnsutils needrestart
+  log_ok "Установлены: vim-tiny, nano, htop, nload, jq, git, tmux, rsync, bind9-dnsutils, needrestart."
 }
 
 phase_sysctl_tune() {
@@ -393,10 +412,30 @@ phase_firewall() {
       run_cmd firewall-cmd --permanent --add-service=https
       run_cmd firewall-cmd --reload
       FW_KIND="firewalld"
+      UFW_IPV6_POLICY="n/a"
+      log_warn "IPv6 в firewalld: проверьте при необходимости: firewall-cmd --permanent --add-service=… и ipv6tables."
       log_ok "firewalld включён (SSH: $([[ "${SSH_DUAL_LISTEN:-0}" == 1 ]] && echo "22+${SSH_PORT}" || echo "${SSH_PORT:-22}"), http, https)."
       ;;
     *)
       apt_install ufw
+      UFW_IPV6_POLICY="both"
+      echo "IPv6 в UFW:"
+      echo "  1) Как в Ubuntu по умолчанию — правила для IPv4 и IPv6"
+      echo "  2) Только IPv4 — отключить IPv6 в UFW (IPV6=no в /etc/default/ufw)"
+      local u6
+      read -r -p "Ваш выбор [1-2]: " u6 || true
+      if [[ "${u6:-1}" == "2" ]]; then
+        UFW_IPV6_POLICY="ipv4_only"
+        if [[ "${DRY_RUN}" == "1" ]]; then
+          log_info "[DRY-RUN] /etc/default/ufw: IPV6=no"
+        else
+          sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+          grep -q '^IPV6=' /etc/default/ufw || echo 'IPV6=no' >> /etc/default/ufw
+        fi
+        log_ok "UFW: для стека используется только IPv4 (IPv6 в ufw отключён)."
+      else
+        log_ok "UFW: IPv4 и IPv6 (как в дефолте Ubuntu)."
+      fi
       run_cmd ufw default deny incoming
       run_cmd ufw default allow outgoing
       if [[ "${SSH_DUAL_LISTEN:-0}" == "1" ]]; then
@@ -726,6 +765,7 @@ write_setup_summary() {
       echo "web_server: ${WEB_STACK:-}"
       echo "database: ${DB_KIND:-}"
       echo "firewall: ${FW_KIND:-}"
+      echo "ufw_ipv6: ${UFW_IPV6_POLICY:-n/a}  # both | ipv4_only | n/a (не UFW)"
       echo "install_log: ${LOG_FILE}"
     } > "${SUMMARY_FILE}"
   )
@@ -735,6 +775,7 @@ write_setup_summary() {
 
 main() {
   require_root
+  maybe_reexec_tmux
   setup_logging
 
   echo ""
@@ -753,6 +794,7 @@ main() {
   WEB_STACK=""
   DB_KIND=""
   FW_KIND="ufw"
+  UFW_IPV6_POLICY="n/a"
   SSH_PORT=22
   SSH_DUAL_LISTEN=0
   SETUP_TIMEZONE=""
@@ -793,4 +835,4 @@ main() {
   echo ""
 }
 
-main
+main "$@"
